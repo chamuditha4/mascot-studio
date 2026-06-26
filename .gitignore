@@ -1,0 +1,15 @@
+# Django
+db.sqlite3
+*.pyc
+__pycache__/
+
+# Media (user uploads)
+media/sessions/
+
+# Environment
+.env
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/

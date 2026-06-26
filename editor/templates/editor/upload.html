@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mascot Studio — Upload</title>
+<style>
+  :root {
+    --bg: #1a1a2e; --surface: #16213e; --accent: #e94560;
+    --text: #eee; --text2: #999;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text);
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { background: var(--surface); border-radius: 16px; padding: 40px;
+          max-width: 480px; width: 90%; box-shadow: 0 8px 32px rgba(0,0,0,.4); }
+  h1 { font-size: 24px; margin-bottom: 8px; }
+  p { color: var(--text2); font-size: 14px; margin-bottom: 24px; }
+  label { display: block; font-size: 13px; color: var(--text2); margin-bottom: 6px; }
+  input[type="file"] { width: 100%; padding: 12px; background: rgba(255,255,255,.05);
+    border: 1px dashed rgba(255,255,255,.15); border-radius: 10px; color: var(--text);
+    margin-bottom: 16px; cursor: pointer; }
+  .row { display: flex; gap: 12px; margin-bottom: 16px; }
+  .row > div { flex: 1; }
+  input[type="number"] { width: 100%; padding: 10px; background: rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.1); border-radius: 8px; color: var(--text); }
+  button { width: 100%; padding: 14px; background: var(--accent); color: #fff;
+    border: none; border-radius: 10px; font-size: 16px; font-weight: 600;
+    cursor: pointer; transition: .2s; }
+  button:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .progress { display: none; margin-top: 16px; }
+  .progress.active { display: block; }
+  .bar { height: 6px; background: rgba(255,255,255,.1); border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--accent); width: 0%; transition: width .3s;
+    border-radius: 3px; }
+  .status { font-size: 13px; color: var(--text2); margin-top: 8px; }
+  .error { color: #f66; font-size: 13px; margin-top: 12px; }
+  .tab.active { background: var(--accent) !important; color: #fff !important; }
+  textarea { font-family: monospace; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎬 Mascot Studio</h1>
+  <p>Upload a green-screen mascot video or import an existing sprite sheet
+     for frame-by-frame touch-up.</p>
+
+  <!-- Tabs -->
+  <div style="display:flex;gap:0;margin-bottom:20px;border-radius:10px;overflow:hidden;border:1px solid var(--border)">
+    <button id="tabUpload" class="tab active" onclick="switchTab('upload')" style="flex:1;padding:10px;border:none;background:transparent;color:var(--text2);font-size:13px;font-weight:600;cursor:pointer">📤 Upload Video</button>
+    <button id="tabImport" class="tab" onclick="switchTab('import')" style="flex:1;padding:10px;border:none;background:transparent;color:var(--text2);font-size:13px;font-weight:600;cursor:pointer">📥 Import Sprite</button>
+  </div>
+
+  <!-- Upload form -->
+  <form id="uploadForm" class="tab-panel">
+    <label>Mascot video (MP4, green screen)</label>
+    <input type="file" id="video" accept="video/mp4,video/webm,video/quicktime" required>
+
+    <div class="row">
+      <div>
+        <label>Frame width (px)</label>
+        <input type="number" id="width" value="500" min="200" max="1000">
+      </div>
+      <div>
+        <label>Output FPS</label>
+        <input type="number" id="fps" value="10" min="4" max="30">
+      </div>
+    </div>
+
+    <button type="submit" id="submitBtn">Process Video</button>
+    <div class="error" id="errorUpload"></div>
+
+    <div class="progress" id="progress">
+      <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+      <div class="status" id="status">Starting…</div>
+    </div>
+  </form>
+
+  <!-- Import form -->
+  <form id="importForm" class="tab-panel" style="display:none">
+    <label>Sprite sheet PNG</label>
+    <input type="file" id="spriteFile" accept="image/png" required>
+
+    <label style="margin-top:12px">Metadata JSON file <span style="font-weight:400;font-size:11px">(optional — paste JSON below instead)</span></label>
+    <input type="file" id="metaFile" accept=".json,application/json">
+
+    <label style="margin-top:12px">Or paste metadata JSON</label>
+    <textarea id="metaJson" rows="5" placeholder='{"frameWidth":401,"frameHeight":619,"totalFrames":40,"columns":7,"rows":6,"fps":10}'
+      style="width:100%;padding:10px;background:rgba(255,255,255,.05);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:12px;font-family:monospace;resize:vertical"></textarea>
+
+    <button type="submit" id="importBtn" style="margin-top:12px">Import & Edit</button>
+    <div class="error" id="errorImport"></div>
+  </form>
+</div>
+
+<script>
+// ── Tab switching ──────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById('tab' + (tab === 'upload' ? 'Upload' : 'Import')).classList.add('active');
+  document.getElementById('uploadForm').style.display = tab === 'upload' ? '' : 'none';
+  document.getElementById('importForm').style.display = tab === 'import' ? '' : 'none';
+}
+
+// ── Upload ─────────────────────────────────────────────────────────
+const uploadForm = document.getElementById('uploadForm');
+const errorUpload = document.getElementById('errorUpload');
+const progressEl = document.getElementById('progress');
+const barFill = document.getElementById('barFill');
+const statusEl = document.getElementById('status');
+const submitBtn = document.getElementById('submitBtn');
+
+uploadForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  errorUpload.textContent = '';
+  const video = document.getElementById('video').files[0];
+  if (!video) { errorUpload.textContent = 'Please select a video.'; return; }
+
+  submitBtn.disabled = true;
+  progressEl.classList.add('active');
+  statusEl.textContent = 'Extracting frames…';
+  barFill.style.width = '10%';
+
+  const fd = new FormData();
+  fd.append('video', video);
+  fd.append('width', document.getElementById('width').value);
+  fd.append('fps', document.getElementById('fps').value);
+
+  try {
+    let progress = 10;
+    const timer = setInterval(() => {
+      progress = Math.min(progress + Math.random() * 8, 85);
+      barFill.style.width = progress + '%';
+      if (progress > 60) statusEl.textContent = 'AI background removal…';
+      if (progress > 80) statusEl.textContent = 'Polishing frames…';
+    }, 2000);
+
+    const resp = await fetch('/api/upload/', { method: 'POST', body: fd });
+    clearInterval(timer);
+
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Upload failed');
+
+    barFill.style.width = '100%';
+    statusEl.textContent = 'Done! Opening editor…';
+    setTimeout(() => { window.location = data.redirect; }, 600);
+  } catch (err) {
+    errorUpload.textContent = err.message;
+    progressEl.classList.remove('active');
+    submitBtn.disabled = false;
+  }
+});
+
+// ── Import ─────────────────────────────────────────────────────────
+const importForm = document.getElementById('importForm');
+const errorImport = document.getElementById('errorImport');
+const importBtn = document.getElementById('importBtn');
+
+importForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  errorImport.textContent = '';
+
+  const spriteFile = document.getElementById('spriteFile').files[0];
+  if (!spriteFile) { errorImport.textContent = 'Please select a sprite sheet PNG.'; return; }
+
+  importBtn.disabled = true;
+  importBtn.textContent = 'Importing…';
+
+  const fd = new FormData();
+  fd.append('sprite', spriteFile);
+
+  const metaFile = document.getElementById('metaFile').files[0];
+  if (metaFile) {
+    fd.append('meta', metaFile);
+  } else {
+    const jsonText = document.getElementById('metaJson').value.trim();
+    if (jsonText) fd.append('meta_json', jsonText);
+  }
+
+  try {
+    const resp = await fetch('/api/import/', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Import failed');
+    window.location = data.redirect;
+  } catch (err) {
+    errorImport.textContent = err.message;
+    importBtn.disabled = false;
+    importBtn.textContent = 'Import & Edit';
+  }
+});
+</script>
+</body>
+</html>
