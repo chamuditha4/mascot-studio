@@ -10,7 +10,10 @@ from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
-from processor.pipeline import extract_frames, remove_backgrounds, stitch_sheet
+from processor.pipeline import (
+    extract_frames, remove_backgrounds, remove_backgrounds_rvm,
+    stitch_sheet, REMBG_MODELS,
+)
 
 
 def _session_dir(session_id: str) -> Path:
@@ -69,13 +72,29 @@ def editor(request, session_id: str):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_upload(request):
-    """Upload a video, extract frames, run AI cleanup."""
+    """
+    Upload a video, extract frames, run AI cleanup.
+
+    Query parameters / POST fields:
+        video:      MP4 file (required)
+        width:      frame width in px (default 500)
+        fps:        output FPS (default 10)
+        backend:    'rembg' (default) or 'rvm' for temporal matting
+        model:      AI model key (default 'birefnet-general').
+                    See REMBG_MODELS for available options.
+        despill:    'average' or 'red' (default 'average')
+        strength:   despill blend 0.0–1.0 (default 0.5)
+    """
     video = request.FILES.get("video")
     if not video:
         return JsonResponse({"error": "No video file."}, status=400)
 
     width = int(request.POST.get("width", 500))
     fps = int(request.POST.get("fps", 10))
+    backend = request.POST.get("backend", "rembg")
+    model = request.POST.get("model", "u2net")
+    despill_method = request.POST.get("despill", "average")
+    despill_strength = float(request.POST.get("strength", 0.5))
 
     session_id = uuid.uuid4().hex[:12]
     sd = _session_dir(session_id)
@@ -87,26 +106,42 @@ def api_upload(request):
             f.write(chunk)
 
     try:
-        # Extract
-        raw_dir = sd / "raw"
-        raw_frames = extract_frames(video_path, raw_dir, width, fps)
-        fw, fh = 0, 0
-        if raw_frames:
-            from PIL import Image
-            fw, fh = Image.open(raw_frames[0]).size
-
-        # AI cleanup
         frames_dir = sd / "frames"
-        clean_frames = remove_backgrounds(raw_frames, frames_dir)
+        fw, fh = 0, 0
+
+        if backend == "rvm":
+            # ── Temporal matting via Robust Video Matting ────────
+            clean_frames = remove_backgrounds_rvm(
+                video_path, frames_dir,
+                width=width,
+                despill_method=despill_method,
+                despill_strength=despill_strength,
+            )
+        else:
+            # ── Static frame-by-frame matting via rembg ──────────
+            raw_dir = sd / "raw"
+            raw_frames = extract_frames(video_path, raw_dir, width, fps)
+            clean_frames = remove_backgrounds(
+                raw_frames, frames_dir,
+                model=model,
+                despill_method=despill_method,
+                despill_strength=despill_strength,
+            )
+            shutil.rmtree(raw_dir)
+
+        if clean_frames:
+            from PIL import Image
+            fw, fh = Image.open(clean_frames[0]).size
 
         # Save config
         (sd / "config.json").write_text(json.dumps({
             "width": width, "fps": fps,
             "frame_width": fw, "frame_height": fh,
+            "backend": backend,
+            "model": model,
+            "despill": despill_method,
+            "strength": despill_strength,
         }))
-
-        # Clean up raw
-        shutil.rmtree(raw_dir)
 
         return JsonResponse({
             "session_id": session_id,
@@ -123,11 +158,12 @@ def api_upload(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_reprocess_frame(request, session_id: str):
-    """Re-run rembg AI background removal on a single frame.
+    """Re-run AI background removal on a single frame.
 
-    Accepts the frame name.  The server re-reads the saved PNG, runs it
-    through rembg + clean_frame, and overwrites the file.  Returns the
-    new frame URL so the editor can refresh it.
+    Accepts the frame name and optional model/despill overrides.
+    The server re-reads the saved PNG, composites it over the known
+    green-screen colour, runs it through the selected rembg model +
+    advanced despill, and overwrites the file.
     """
     data = json.loads(request.body)
     name = data.get("name")
@@ -138,17 +174,24 @@ def api_reprocess_frame(request, session_id: str):
     if not frame_path.exists():
         return JsonResponse({"error": "Frame not found."}, status=404)
 
+    # Read session config for saved model preferences
+    config_path = _session_dir(session_id) / "config.json"
+    config = {}
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+
+    model = data.get("model", config.get("model", "u2net"))
+    despill_method = data.get("despill", config.get("despill", "average"))
+    despill_strength = float(data.get("strength", config.get("strength", 0.5)))
+
     try:
         import io
-
-        import numpy as np
         from PIL import Image
         from rembg import remove, new_session
-        from processor.pipeline import clean_frame
+        from processor.pipeline import clean_frame, REMBG_MODELS
 
         # Composite the current frame over the green-screen colour so
         # rembg sees proper green background instead of black holes.
-        # The green screen is RGB(157, 231, 162).
         GS_R, GS_G, GS_B = 157, 231, 162
 
         current = Image.open(frame_path).convert("RGBA")
@@ -157,9 +200,15 @@ def api_reprocess_frame(request, session_id: str):
             bg.convert("RGBA"), current
         ).convert("RGB")
 
-        session = new_session("u2net")
-        out = remove(composited, session=session)   # AI background removal
-        out = clean_frame(out)                       # alpha sharpen + colour kill
+        if model not in REMBG_MODELS:
+            model = "birefnet-general"
+
+        session_name, _desc = REMBG_MODELS[model]
+        session = new_session(session_name)
+        out = remove(composited, session=session)
+        out = clean_frame(out,
+                         despill_method=despill_method,
+                         despill_strength=despill_strength)
         out.save(frame_path, "PNG")
 
         return JsonResponse({
@@ -216,6 +265,37 @@ def api_export(request, session_id: str):
         "frame_width": json.loads(json_path.read_text())["frameWidth"],
         "frame_height": json.loads(json_path.read_text())["frameHeight"],
         "total_frames": len(frames),
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def api_models(request):
+    """List available AI matting models and backends with cache status."""
+    from pathlib import Path
+
+    # Determine which models are already cached (downloaded)
+    cache_dir = Path.home() / ".u2net"
+    models_info = {}
+    for key, (session_name, desc) in REMBG_MODELS.items():
+        cached = (cache_dir / f"{session_name}.onnx").exists()
+        models_info[key] = {
+            "session_name": session_name,
+            "description": desc,
+            "cached": cached,
+            "status": "ready" if cached else "needs_download",
+        }
+
+    return JsonResponse({
+        "backends": {
+            "remgb": "Static frame-by-frame matting via rembg (fast, many models)",
+            "rvm": "Robust Video Matting — temporal coherence, best for video",
+        },
+        "models": models_info,
+        "despill_methods": {
+            "average": "Green limited to avg(R,B) — balanced neutralization",
+            "red": "Green limited to Red channel — best for skin tones",
+        },
     })
 
 

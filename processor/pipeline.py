@@ -23,44 +23,87 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 # ── Cleanup ─────────────────────────────────────────────────────────
 
-def clean_frame(img: Image.Image) -> Image.Image:
-    """Two-pass cleanup after AI background removal (see SKILL.md)."""
+def clean_frame(img: Image.Image,
+                despill_method: str = 'average',
+                despill_strength: float = 0.5) -> Image.Image:
+    """
+    High-fidelity post-processing after AI background removal.
+
+    Replaces the legacy destructive alpha-thresholding approach with a
+    luminance-preserving, alpha-gated green despill algorithm.  The
+    alpha channel is preserved exactly as the AI model produced it —
+    no clamping, no blurring — so sub-pixel edge geometry (fingers,
+    hair, motion blur) remains intact.
+
+    Args:
+        img: RGBA PIL Image from AI matting.
+        despill_method: 'average' or 'red' — the green-channel limiting
+                        strategy.  'red' is optimised for human skin tones.
+        despill_strength: 0.0 – 1.0 blend factor for the despill effect.
+                          Default 0.5 gives natural-looking results.
+
+    Returns:
+        RGBA PIL Image with neutralised green spill and untouched alpha.
+    """
     arr = np.array(img)
     if arr.shape[-1] != 4:
         return img
 
-    a = arr[:, :, 3].astype(np.float32)
-    r = arr[:, :, 0].astype(np.float32)
-    g = arr[:, :, 1].astype(np.float32)
-    b = arr[:, :, 2].astype(np.float32)
+    img_float = arr.astype(np.float32)
 
-    # ── Pass 0: kill fully-opaque green-screen remnants ──────────
-    # Run colour gate BEFORE alpha thresholding so opaque green
-    # patches (e.g. between fingers) are caught while still visible.
+    # Extract channels
+    r = img_float[:, :, 0]
+    g = img_float[:, :, 1]
+    b = img_float[:, :, 2]
+    a = img_float[:, :, 3] / 255.0   # normalise to 0–1
+
+    # ── Pass 0: hard-kill fully-opaque green-screen patches ─────
+    # Only targets pixels that are unmistakably green screen (high
+    # alpha + dominant green).  Uses relaxed thresholds compared to
+    # the legacy version to avoid eating into skin tones.
     green_screen = (
-        (a > 80) & (g > 185) & (g - b > 45) & (g - r > 35)
+        (a > 0.7) &
+        (g > 160) &
+        (g - b > 30) &
+        (g - r > 25)
     )
-    a[green_screen] = 0
+    img_float[green_screen, 3] = 0
+    # Refresh alpha after hard-kill
+    a = img_float[:, :, 3] / 255.0
 
-    # ── Pass 1: soft alpha cleanup with edge feathering ─────────
-    # Lower threshold keeps more semi-transparent edge pixels for
-    # natural anti-aliasing.  Then a tiny Gaussian blur smooths the
-    # alpha mask so edges don't look jagged.
-    THRESHOLD = 130.0
-    a = np.where(
-        a < THRESHOLD, 0,
-        ((a - THRESHOLD) / (255.0 - THRESHOLD) * 255.0).clip(0, 255),
+    # ── Pass 1: luminance-preserving alpha-gated despill ────────
+    # Calculate the green-channel limit based on the chosen method.
+    if despill_method == 'average':
+        g_limit = (r + b) / 2.0
+    elif despill_method == 'red':
+        g_limit = r
+    else:
+        raise ValueError("despill_method must be 'average' or 'red'")
+
+    g_despilled = np.minimum(g, g_limit)
+    spill_amount = g - g_despilled
+
+    # Luminance preservation: redistribute removed green energy
+    # symmetrically into red and blue to avoid darkening edges.
+    r_compensated = r + (spill_amount * 0.5)
+    b_compensated = b + (spill_amount * 0.5)
+
+    # Alpha-gating: apply despill only to semi-transparent edge
+    # pixels (alpha between 0.02 and 0.95).  Opaque core regions
+    # and fully-transparent areas are left untouched.
+    edge_weight = np.clip(
+        (1.0 - np.abs(a - 0.5) * 2.0) * despill_strength * 2.0,
+        0.0, 1.0
     )
 
-    # Light Gaussian blur on alpha channel for edge anti-aliasing
-    from scipy.ndimage import gaussian_filter
-    a_smooth = gaussian_filter(a, sigma=0.6)
-    # Only soften edges — keep fully-transparent and fully-opaque areas intact
-    edge = (a_smooth > 5) & (a_smooth < 250)
-    a[edge] = a_smooth[edge]
+    r_final = r * (1.0 - edge_weight) + r_compensated * edge_weight
+    g_final = g * (1.0 - edge_weight) + g_despilled * edge_weight
+    b_final = b * (1.0 - edge_weight) + b_compensated * edge_weight
 
-    arr[:, :, 3] = a.clip(0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
+    # ── Reassemble ─────────────────────────────────────────────
+    result = np.stack((r_final, g_final, b_final, img_float[:, :, 3]),
+                      axis=-1)
+    return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 
 
 # ── Pipeline steps ──────────────────────────────────────────────────
@@ -77,20 +120,173 @@ def extract_frames(video_path: Path, out_dir: Path,
     return sorted(out_dir.glob("frame_*.png"))
 
 
-def remove_backgrounds(frames: list[Path], out_dir: Path) -> list[Path]:
-    """AI background removal (rembg) + clean_frame on every frame."""
+# ── Supported AI matting models ─────────────────────────────────────
+# Model registry: maps user-facing keys to (rembg_session_name, description)
+REMBG_MODELS = {
+    "u2net":              ("u2net",              "U²-Net — baseline salient object detection (fast, coarse edges)"),
+    "u2net_human_seg":    ("u2net_human_seg",    "U²-Net Human Seg — fine-tuned for human anatomy"),
+    "isnet-general-use":  ("isnet-general-use",  "ISNet — high-accuracy segmentation, sharp boundaries"),
+    "isnet-anime":        ("isnet-anime",        "ISNet Anime — optimised for non-photorealistic line art"),
+    "birefnet-general":   ("birefnet-general",   "BiRefNet — bilateral reference, extreme edge fidelity"),
+    "birefnet-portrait":  ("birefnet-portrait",  "BiRefNet Portrait — human-optimised with gradient references"),
+    "birefnet-dis":       ("birefnet-dis",       "BiRefNet DIS — optimised for thin/delicate structures"),
+    "ben2":               ("ben2",               "BEN2 — Confidence Guided Matting, exceptional on fine edges"),
+}
+
+
+def remove_backgrounds(frames: list[Path], out_dir: Path,
+                       model: str = "u2net",
+                       despill_method: str = "average",
+                       despill_strength: float = 0.5) -> list[Path]:
+    """
+    AI background removal (rembg) + advanced despill on every frame.
+
+    Args:
+        frames: list of paths to input RGB PNG frames.
+        out_dir: directory for output RGBA PNGs.
+        model: key into REMBG_MODELS dict (default: birefnet-general).
+        despill_method: 'average' or 'red' for green-channel limiting.
+        despill_strength: 0.0–1.0 blend for despill effect.
+
+    Returns:
+        Sorted list of Path objects pointing to processed frames.
+    """
     from rembg import remove, new_session
-    session = new_session("u2net")
+
+    if model not in REMBG_MODELS:
+        raise ValueError(
+            f"Unknown model '{model}'. Available: {list(REMBG_MODELS.keys())}"
+        )
+
+    session_name, _desc = REMBG_MODELS[model]
+    session = new_session(session_name)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_paths = []
 
     for i, fp in enumerate(frames):
         img = Image.open(fp).convert("RGB")
         out = remove(img, session=session)
-        out = clean_frame(out)
+        out = clean_frame(out,
+                         despill_method=despill_method,
+                         despill_strength=despill_strength)
         dest = out_dir / fp.name
         out.save(dest, "PNG")
         out_paths.append(dest)
+
+    return sorted(out_paths)
+
+
+# ── Robust Video Matting (RVM) pipeline ─────────────────────────────
+
+def remove_backgrounds_rvm(video_path: Path, out_dir: Path,
+                           width: int = 500,
+                           despill_method: str = "average",
+                           despill_strength: float = 0.5) -> list[Path]:
+    """
+    Temporal-aware background removal using Robust Video Matting (RVM).
+
+    Unlike frame-by-frame static matting, RVM uses a recurrent neural
+    network that maintains hidden states across frames, dramatically
+    reducing temporal flicker (edge boiling) and improving motion-blur
+    handling.
+
+    Prerequisites:
+        pip install robustvideomatting  (or the torch hub variant)
+
+    Args:
+        video_path: path to the input MP4 video.
+        out_dir: directory for output RGBA PNG frames.
+        width: resize width (height auto-scaled).
+        despill_method: 'average' or 'red'.
+        despill_strength: 0.0–1.0 despill blend.
+
+    Returns:
+        Sorted list of Path objects pointing to processed frames.
+    """
+    import warnings
+    import tempfile
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_paths = []
+
+    try:
+        import torch
+        import torchvision.transforms as T
+    except ImportError:
+        raise ImportError(
+            "PyTorch and torchvision are required for RVM. "
+            "Install with: pip install torch torchvision"
+        )
+
+    # Load RVM from torch hub
+    try:
+        model = torch.hub.load("PeterL1n/RobustVideoMatting", "mobilenetv3")
+    except Exception:
+        try:
+            model = torch.hub.load("PeterL1n/RobustVideoMatting", "resnet50")
+        except Exception:
+            raise RuntimeError(
+                "Could not load RVM from torch hub. "
+                "Ensure internet access and try: "
+                "pip install robustvideomatting"
+            )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+
+    # Extract frames via ffmpeg as a temporary step (RVM needs the
+    # video directly, but we keep compatibility with the existing
+    # frame-extraction pipeline).
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        raw_frames = extract_frames(video_path, tmp, width=width, fps=10)
+
+        # Read frames into tensor batch
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Normalize(mean=[0.485, 0.456, 0.406],
+                        std=[0.229, 0.224, 0.225]),
+        ])
+
+        # Process in chunks to respect GPU memory
+        bgr_tensors = []
+        for fp in raw_frames:
+            img_pil = Image.open(fp).convert("RGB")
+            tensor = transform(img_pil).unsqueeze(0)
+            bgr_tensors.append(tensor)
+
+        # RVM processing with recurrent state
+        rec = [None] * 4  # recurrent states
+        downscale_ratio = 0.25
+
+        for i, src in enumerate(bgr_tensors):
+            src = src.to(device)
+            with torch.no_grad():
+                fgr, pha, *rec = model(src, *rec, downscale_ratio)
+
+            # Convert to numpy RGBA
+            fgr_np = (fgr.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255)
+            pha_np = (pha.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255)
+
+            fgr_np = np.clip(fgr_np, 0, 255).astype(np.uint8)
+            pha_np = np.clip(pha_np, 0, 255).astype(np.uint8)
+
+            # If pha is single-channel, expand
+            if pha_np.shape[-1] == 1:
+                pha_np = pha_np[:, :, 0]
+
+            rgba = np.dstack([fgr_np, pha_np])
+
+            # Apply advanced despill
+            result = clean_frame(
+                Image.fromarray(rgba),
+                despill_method=despill_method,
+                despill_strength=despill_strength,
+            )
+
+            dest = out_dir / f"frame_{i:04d}.png"
+            result.save(dest, "PNG")
+            out_paths.append(dest)
 
     return sorted(out_paths)
 

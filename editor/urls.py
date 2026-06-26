@@ -10,6 +10,7 @@ urlpatterns = [
 
     # API
     path("api/upload/", views.api_upload, name="api_upload"),
+    path("api/models/", views.api_models, name="api_models"),
     path("api/import/", views.api_import, name="api_import"),
     path("api/save-frame/<str:session_id>/", views.api_save_frame, name="api_save_frame"),
     path("api/reprocess-frame/<str:session_id>/", views.api_reprocess_frame, name="api_reprocess_frame"),

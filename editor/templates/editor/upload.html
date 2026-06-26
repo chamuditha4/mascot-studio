@@ -38,6 +38,8 @@
   .error { color: #f66; font-size: 13px; margin-top: 12px; }
   .tab.active { background: var(--accent) !important; color: #fff !important; }
   textarea { font-family: monospace; }
+  select { cursor: pointer; }
+  select option { background: var(--surface); color: var(--text); }
 </style>
 </head>
 <body>
@@ -68,6 +70,43 @@
       </div>
     </div>
 
+    <!-- Backend selection -->
+    <label style="margin-top:4px">Matting Backend</label>
+    <div class="row">
+      <div>
+        <select id="backend" style="width:100%;padding:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:var(--text);font-size:13px" onchange="onBackendChange()">
+          <option value="rembg">🧩 rembg (static frames)</option>
+          <option value="rvm">🎬 RVM (temporal matting)</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Model selection (visible only for rembg backend) -->
+    <div id="modelGroup">
+      <label style="margin-top:4px">AI Model</label>
+      <select id="model" style="width:100%;padding:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:var(--text);font-size:13px">
+        <option value="">Loading available models…</option>
+      </select>
+      <p style="font-size:11px;color:var(--text2);margin-top:4px" id="modelDesc"></p>
+    </div>
+
+    <!-- Despill options -->
+    <label style="margin-top:8px">Green Spill Removal</label>
+    <div class="row">
+      <div>
+        <select id="despill" style="width:100%;padding:10px;background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;color:var(--text);font-size:13px">
+          <option value="average">Average Despill (balanced)</option>
+          <option value="red">Red-Limit Despill (skin tones)</option>
+        </select>
+      </div>
+      <div>
+        <label style="font-size:11px;margin-bottom:2px">Strength: <span id="strengthVal">0.5</span></label>
+        <input type="range" id="strength" min="0" max="1" step="0.05" value="0.5"
+               style="width:100%;accent-color:var(--accent)"
+               oninput="document.getElementById('strengthVal').textContent=this.value">
+      </div>
+    </div>
+
     <button type="submit" id="submitBtn">Process Video</button>
     <div class="error" id="errorUpload"></div>
 
@@ -95,6 +134,80 @@
 </div>
 
 <script>
+// ── Model cache detection on page load ─────────────────────────────
+const modelDescriptions = {
+  'u2net': 'U²-Net — baseline, always available, fast inference',
+  'u2net_human_seg': 'U²-Net Human Seg — fine-tuned for human anatomy',
+  'isnet-general-use': 'ISNet General — high-accuracy, sharp boundaries',
+  'isnet-anime': 'ISNet Anime — optimised for line art / cel shading',
+  'birefnet-general': 'BiRefNet General — extreme edge fidelity via bilateral references ⭐',
+  'birefnet-portrait': 'BiRefNet Portrait — human-optimised, gradient-aware edges',
+  'birefnet-dis': 'BiRefNet DIS — optimised for thin structures (fingers, hair)',
+  'ben2': 'BEN2 — Confidence Guided Matting, exceptional fine-edge refinement',
+};
+
+async function loadModels() {
+  const select = document.getElementById('model');
+  try {
+    const resp = await fetch('/api/models/');
+    const data = await resp.json();
+    const models = data.models;
+
+    // Sort: cached first, then uncached
+    const entries = Object.entries(models).sort((a, b) => {
+      if (a[1].cached && !b[1].cached) return -1;
+      if (!a[1].cached && b[1].cached) return 1;
+      return 0;
+    });
+
+    select.innerHTML = '';
+    let firstCached = null;
+
+    entries.forEach(([key, info]) => {
+      const opt = document.createElement('option');
+      opt.value = key;
+      const cachedLabel = info.cached ? '✅' : '⬇️';
+      const sizeNote = info.cached ? '' : ' [needs download ~150-970MB]';
+      opt.textContent = `${cachedLabel} ${key}${sizeNote}`;
+      if (info.cached && !firstCached) firstCached = key;
+      select.appendChild(opt);
+    });
+
+    // Default to first cached model, or u2net if nothing is cached
+    if (firstCached) {
+      select.value = firstCached;
+    } else {
+      select.value = 'u2net';
+    }
+
+    document.getElementById('modelDesc').textContent =
+      modelDescriptions[select.value] || '';
+  } catch (err) {
+    // Fallback: populate with known models
+    select.innerHTML = '<option value="u2net">✅ u2net — baseline (always available)</option>';
+    document.getElementById('modelDesc').textContent = modelDescriptions['u2net'];
+  }
+}
+
+loadModels();
+
+document.getElementById('model').addEventListener('change', function() {
+  document.getElementById('modelDesc').textContent =
+    modelDescriptions[this.value] || '';
+  // Warn if model needs download
+  const selected = this.options[this.selectedIndex];
+  if (selected && selected.textContent.includes('⬇️')) {
+    document.getElementById('modelDesc').textContent +=
+      ' ⚠️ First use will download the model (~2-10 min on slow connections).';
+  }
+});
+
+function onBackendChange() {
+  const backend = document.getElementById('backend').value;
+  document.getElementById('modelGroup').style.display =
+    backend === 'rvm' ? 'none' : '';
+}
+
 // ── Tab switching ──────────────────────────────────────────────────
 function switchTab(tab) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -126,15 +239,21 @@ uploadForm.addEventListener('submit', async (e) => {
   fd.append('video', video);
   fd.append('width', document.getElementById('width').value);
   fd.append('fps', document.getElementById('fps').value);
+  fd.append('backend', document.getElementById('backend').value);
+  fd.append('model', document.getElementById('model').value);
+  fd.append('despill', document.getElementById('despill').value);
+  fd.append('strength', document.getElementById('strength').value);
 
   try {
     let progress = 10;
     const timer = setInterval(() => {
-      progress = Math.min(progress + Math.random() * 8, 85);
+      progress = Math.min(progress + Math.random() * 5, 85);
       barFill.style.width = progress + '%';
-      if (progress > 60) statusEl.textContent = 'AI background removal…';
-      if (progress > 80) statusEl.textContent = 'Polishing frames…';
-    }, 2000);
+      if (progress < 25) statusEl.textContent = 'Extracting frames…';
+      else if (progress < 45) statusEl.textContent = 'Loading AI model (may download on first use)…';
+      else if (progress < 70) statusEl.textContent = 'AI background removal…';
+      else statusEl.textContent = 'Despill & polishing…';
+    }, 1500);
 
     const resp = await fetch('/api/upload/', { method: 'POST', body: fd });
     clearInterval(timer);
