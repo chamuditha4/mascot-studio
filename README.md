@@ -8,6 +8,16 @@ Upload an MP4, let the matting model cut out the background, clean up the
 stray pixels by hand with a canvas eraser, and export a packed sprite sheet
 plus a metadata JSON that any game or animation runtime can consume.
 
+<p align="center">
+  <img src="examples/preview/celebrating-source.webp" width="210" alt="Green-screen source video of the mascot celebrating">
+  &nbsp;&nbsp;&nbsp;
+  <img src="examples/preview/celebrating-cutout.webp" width="210" alt="The same animation with the background removed">
+</p>
+<p align="center">
+  <em>Green-screen source on the left, transparent result on the right. The
+  checkerboard is alpha.</em>
+</p>
+
 ## Requirements
 
 - Python 3.10+
@@ -24,20 +34,35 @@ python manage.py runserver
 # Open http://127.0.0.1:8000
 ```
 
-The first run downloads the selected matting model (~100–900 MB depending on
-the model) into `~/.u2net/`. Later runs reuse the cache.
+The first run downloads the selected matting model into `~/.u2net/`, which is
+anywhere from 100 MB to 900 MB depending on which one you pick. Later runs
+reuse the cache.
 
 ## Examples
 
-[`examples/`](examples/) has two complete jobs — the green-screen source video
-plus the sprite sheet and metadata the tool produced from it:
+[`examples/`](examples/) has two complete jobs, each with the green-screen
+source video plus the sprite sheet and metadata the tool produced from it.
+Both are 40 frames at 10fps.
 
-| Example | Source | Output | Frames |
-|---------|--------|--------|--------|
-| Celebrating | [`.mp4`](examples/Celebrating/Celebrating.mp4) | [`.png`](examples/Celebrating/Celebrating.png) + [`.json`](examples/Celebrating/Celebrating.json) | 40 @ 10fps |
-| Concerned | [`.mp4`](examples/Concerned/Concerned.mp4) | [`.png`](examples/Concerned/Concerned.png) + [`.json`](examples/Concerned/Concerned.json) | 40 @ 10fps |
+<table>
+<tr>
+<th width="25%">Source video</th>
+<th width="25%">Result</th>
+<th width="50%">Sprite sheet</th>
+</tr>
+<tr>
+<td align="center"><img src="examples/preview/celebrating-source.webp" width="150" alt="Celebrating source"></td>
+<td align="center"><img src="examples/preview/celebrating-cutout.webp" width="150" alt="Celebrating cutout"></td>
+<td align="center"><img src="examples/preview/celebrating-sheet.png" width="300" alt="Celebrating sprite sheet"><br><b>Celebrating</b>, 2842×4092, 7×6 grid<br><a href="examples/Celebrating/Celebrating.mp4">mp4</a> · <a href="examples/Celebrating/Celebrating.png">png</a> · <a href="examples/Celebrating/Celebrating.json">json</a></td>
+</tr>
+<tr>
+<td align="center"><img src="examples/preview/concerned-source.webp" width="150" alt="Concerned source"></td>
+<td align="center"><img src="examples/preview/concerned-cutout.webp" width="150" alt="Concerned cutout"></td>
+<td align="center"><img src="examples/preview/concerned-sheet.png" width="300" alt="Concerned sprite sheet"><br><b>Concerned</b>, 2016×3954, 7×6 grid<br><a href="examples/Concerned/Concerned.mp4">mp4</a> · <a href="examples/Concerned/Concerned.png">png</a> · <a href="examples/Concerned/Concerned.json">json</a></td>
+</tr>
+</table>
 
-Upload a `.mp4` to exercise the full pipeline, or import a finished `.png` +
+Upload a `.mp4` to exercise the full pipeline, or import a finished `.png` plus
 `.json` pair to jump straight into the editor without waiting on the model.
 
 ## Workflow
@@ -47,9 +72,9 @@ Upload a `.mp4` to exercise the full pipeline, or import a finished `.png` +
    green light bleeding onto the subject's edges.
 3. **Edit** frame by frame with the canvas eraser, or re-run the AI on a
    single bad frame with a different model.
-4. **Export** a sprite sheet + metadata JSON.
+4. **Export** a sprite sheet plus metadata JSON.
 
-You can also **import** an existing sprite sheet (PNG + metadata JSON) to
+You can also **import** an existing sprite sheet (PNG plus metadata JSON) to
 split it back into editable frames.
 
 ## Features
@@ -62,13 +87,13 @@ split it back into editable frames.
 - Canvas eraser with variable brush size, per-frame undo
 - Filmstrip navigation and animation playback preview
 - Export to a GPU-safe sprite sheet (max 4096×4096)
-- Keyboard shortcuts: `←`/`→` navigate, `E` erase, `Ctrl+Z` undo, `Ctrl+S` save
+- Keyboard shortcuts. `←`/`→` navigate, `E` erase, `Ctrl+Z` undo, `Ctrl+S` save
 
-### Optional: temporal matting backend
+### Optional temporal matting backend
 
 The `rvm` backend uses [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting),
 a recurrent network that carries state across frames and largely eliminates
-edge boiling. It needs PyTorch:
+edge boiling. It needs PyTorch.
 
 ```bash
 pip install -r requirements-rvm.txt
@@ -76,13 +101,13 @@ pip install -r requirements-rvm.txt
 
 ## Configuration
 
-All settings are read from the environment — see [.env.example](.env.example).
+All settings are read from the environment. See [.env.example](.env.example).
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DJANGO_SECRET_KEY` | — | Required when `DJANGO_DEBUG=0` |
-| `DJANGO_DEBUG` | `1` | Debug pages; also serves `/media/` from the dev server |
-| `DJANGO_ALLOWED_HOSTS` | — | Comma-separated hosts, used when debug is off |
+| `DJANGO_SECRET_KEY` | none | Required when `DJANGO_DEBUG=0` |
+| `DJANGO_DEBUG` | `1` | Debug pages, and serves `/media/` from the dev server |
+| `DJANGO_ALLOWED_HOSTS` | none | Comma-separated hosts, used when debug is off |
 | `MAX_UPLOAD_MB` | `200` | Upload size ceiling |
 
 ## Deployment note
@@ -91,11 +116,11 @@ All settings are read from the environment — see [.env.example](.env.example).
 authentication, and anyone who can reach the server can upload videos, run GPU
 work, and read every session's frames by guessing a session id. Run it on
 `127.0.0.1`, or put it behind your own auth layer and a real WSGI server before
-exposing it. With `DJANGO_DEBUG=0` you must also serve `media/` yourself —
-Django's dev-server media route is disabled outside debug.
+exposing it. With `DJANGO_DEBUG=0` you must also serve `media/` yourself,
+because Django's dev-server media route is disabled outside debug.
 
 Uploaded videos, frames, and exports accumulate under `media/sessions/` and are
-never garbage-collected; prune that directory yourself.
+never garbage-collected, so prune that directory yourself.
 
 ## Project structure
 
@@ -133,7 +158,7 @@ mascot-studio/
 
 ## Sprite sheet format
 
-Export produces `sprite.png` and `sprite.json`:
+Export produces `sprite.png` and `sprite.json`.
 
 ```json
 {
@@ -147,14 +172,14 @@ Export produces `sprite.png` and `sprite.json`:
 Frames are packed left-to-right, top-to-bottom, so frame `i` sits at
 `(i % columns * frameWidth, i // columns * frameHeight)`.
 
-## Hire me
+## Hire iOS developers
 
-I build the mobile side of projects like this one. If you're looking for an
-iOS or Android developer, I'm available at **$1,500/month** to work on your
-mobile app.
+I build the mobile side of projects like this one. If you want to
+[hire iOS developers](https://jayasena.dev/) for your app, book a free meeting
+from my site and we can talk through the scope and what it would cost.
 
-**[jayasena.dev](https://jayasena.dev/)** — portfolio and contact.
+**[jayasena.dev](https://jayasena.dev/)**
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
