@@ -27,6 +27,19 @@ python manage.py runserver
 The first run downloads the selected matting model (~100–900 MB depending on
 the model) into `~/.u2net/`. Later runs reuse the cache.
 
+## Examples
+
+[`examples/`](examples/) has two complete jobs — the green-screen source video
+plus the sprite sheet and metadata the tool produced from it:
+
+| Example | Source | Output | Frames |
+|---------|--------|--------|--------|
+| Celebrating | [`.mp4`](examples/Celebrating/Celebrating.mp4) | [`.png`](examples/Celebrating/Celebrating.png) + [`.json`](examples/Celebrating/Celebrating.json) | 40 @ 10fps |
+| Concerned | [`.mp4`](examples/Concerned/Concerned.mp4) | [`.png`](examples/Concerned/Concerned.png) + [`.json`](examples/Concerned/Concerned.json) | 40 @ 10fps |
+
+Upload a `.mp4` to exercise the full pipeline, or import a finished `.png` +
+`.json` pair to jump straight into the editor without waiting on the model.
+
 ## Workflow
 
 1. **Upload** a green-screen video (MP4).

@@ -10,6 +10,8 @@ import json
 import shutil
 import tempfile
 
+from django.conf import settings
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import Client, TestCase, override_settings
 from PIL import Image
 
@@ -135,6 +137,18 @@ class EditorViewTests(TestCase):
         r = self.client.post(f"/api/export/{session_id}/")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["total_frames"], 2)
+
+    def test_bundled_example_sheet_imports(self):
+        """The checked-in examples must stay loadable as the format evolves."""
+        base = settings.BASE_DIR / "examples" / "Celebrating" / "Celebrating"
+        r = self.client.post("/api/import/", {
+            "sprite": SimpleUploadedFile("sheet.png", base.with_suffix(".png").read_bytes(),
+                                         "image/png"),
+            "meta": SimpleUploadedFile("meta.json", base.with_suffix(".json").read_bytes(),
+                                       "application/json"),
+        })
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual(r.json()["frame_count"], 40)
 
     def test_models_endpoint_lists_the_registry(self):
         r = self.client.get("/api/models/")
