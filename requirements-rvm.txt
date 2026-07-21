@@ -1,0 +1,4 @@
+# Optional extras for the Robust Video Matting ('rvm') backend.
+-r requirements.txt
+torch>=2.0
+torchvision>=0.15

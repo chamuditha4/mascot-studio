@@ -1,11 +1,13 @@
 import json
-import os
+import logging
+import re
 import shutil
 import uuid
 from pathlib import Path
 
 from django.conf import settings
-from django.http import HttpResponse, JsonResponse
+from django.core.exceptions import SuspiciousOperation
+from django.http import JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -15,11 +17,42 @@ from processor.pipeline import (
     stitch_sheet, REMBG_MODELS,
 )
 
+# Session ids are uuid4().hex[:12]; frames are always frame_NNNN.png.
+# Both are attacker-controlled in URLs and JSON bodies, so they are
+# matched against these patterns before ever touching the filesystem.
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+FRAME_NAME_RE = re.compile(r"^frame_\d{4,6}\.png$")
+
+# Guard rails for sprite-sheet import — a hostile metadata JSON could
+# otherwise ask us to allocate an unbounded number of frames.
+MAX_IMPORT_FRAMES = 2000
+MAX_FRAME_DIM = 4096
+
+
+logger = logging.getLogger(__name__)
+
+
+def _server_error(message: str, exc: Exception) -> JsonResponse:
+    """Log the real failure; only surface details while DEBUG is on."""
+    logger.exception(message)
+    detail = f"{message}: {exc}" if settings.DEBUG else message
+    return JsonResponse({"error": detail}, status=500)
+
 
 def _session_dir(session_id: str) -> Path:
+    """Resolve (and create) a session directory, rejecting unsafe ids."""
+    if not SESSION_ID_RE.match(session_id):
+        raise SuspiciousOperation("Invalid session id.")
     d = Path(settings.MEDIA_ROOT) / "sessions" / session_id
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _frame_path(session_id: str, name: str) -> Path:
+    """Resolve a frame file inside a session, rejecting unsafe names."""
+    if not isinstance(name, str) or not FRAME_NAME_RE.match(name):
+        raise SuspiciousOperation("Invalid frame name.")
+    return _session_dir(session_id) / "frames" / name
 
 
 def _frame_list(session_id: str) -> list[dict]:
@@ -89,12 +122,31 @@ def api_upload(request):
     if not video:
         return JsonResponse({"error": "No video file."}, status=400)
 
-    width = int(request.POST.get("width", 500))
-    fps = int(request.POST.get("fps", 10))
+    try:
+        width = int(request.POST.get("width", 500))
+        fps = int(request.POST.get("fps", 10))
+        despill_strength = float(request.POST.get("strength", 0.5))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "width, fps and strength must be numeric."},
+                            status=400)
+
+    if not 32 <= width <= MAX_FRAME_DIM:
+        return JsonResponse({"error": f"width must be 32–{MAX_FRAME_DIM}."}, status=400)
+    if not 1 <= fps <= 60:
+        return JsonResponse({"error": "fps must be 1–60."}, status=400)
+    despill_strength = min(max(despill_strength, 0.0), 1.0)
+
     backend = request.POST.get("backend", "rembg")
+    if backend not in ("rembg", "rvm"):
+        return JsonResponse({"error": "backend must be 'rembg' or 'rvm'."}, status=400)
+
     model = request.POST.get("model", "u2net")
+    if model not in REMBG_MODELS:
+        return JsonResponse({"error": f"Unknown model '{model}'."}, status=400)
+
     despill_method = request.POST.get("despill", "average")
-    despill_strength = float(request.POST.get("strength", 0.5))
+    if despill_method not in ("average", "red"):
+        return JsonResponse({"error": "despill must be 'average' or 'red'."}, status=400)
 
     session_id = uuid.uuid4().hex[:12]
     sd = _session_dir(session_id)
@@ -152,7 +204,7 @@ def api_upload(request):
         })
     except Exception as e:
         shutil.rmtree(sd, ignore_errors=True)
-        return JsonResponse({"error": str(e)}, status=500)
+        return _server_error("Video processing failed", e)
 
 
 @csrf_exempt
@@ -170,7 +222,7 @@ def api_reprocess_frame(request, session_id: str):
     if not name:
         return JsonResponse({"error": "Missing frame name."}, status=400)
 
-    frame_path = _session_dir(session_id) / "frames" / name
+    frame_path = _frame_path(session_id, name)
     if not frame_path.exists():
         return JsonResponse({"error": "Frame not found."}, status=404)
 
@@ -181,14 +233,23 @@ def api_reprocess_frame(request, session_id: str):
         config = json.loads(config_path.read_text())
 
     model = data.get("model", config.get("model", "u2net"))
+    if model not in REMBG_MODELS:
+        model = "birefnet-general"
+
     despill_method = data.get("despill", config.get("despill", "average"))
-    despill_strength = float(data.get("strength", config.get("strength", 0.5)))
+    if despill_method not in ("average", "red"):
+        despill_method = "average"
 
     try:
-        import io
+        despill_strength = float(data.get("strength", config.get("strength", 0.5)))
+    except (TypeError, ValueError):
+        despill_strength = 0.5
+    despill_strength = min(max(despill_strength, 0.0), 1.0)
+
+    try:
         from PIL import Image
         from rembg import remove, new_session
-        from processor.pipeline import clean_frame, REMBG_MODELS
+        from processor.pipeline import clean_frame
 
         # Composite the current frame over the green-screen colour so
         # rembg sees proper green background instead of black holes.
@@ -199,9 +260,6 @@ def api_reprocess_frame(request, session_id: str):
         composited = Image.alpha_composite(
             bg.convert("RGBA"), current
         ).convert("RGB")
-
-        if model not in REMBG_MODELS:
-            model = "birefnet-general"
 
         session_name, _desc = REMBG_MODELS[model]
         session = new_session(session_name)
@@ -216,27 +274,36 @@ def api_reprocess_frame(request, session_id: str):
             "url": f"/media/sessions/{session_id}/frames/{name}",
         })
     except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
+        return _server_error("Frame reprocessing failed", e)
 
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_save_frame(request, session_id: str):
     """Save an edited frame (overwrite the PNG with the edited data URL)."""
+    import base64
+    import binascii
+
     data = json.loads(request.body)
     name = data.get("name")
-    image_data = data.get("image")  # base64 data URL
+    image_data = data.get("image")  # base64 PNG data URL
 
-    if not name or not image_data:
+    if not name or not isinstance(image_data, str):
         return JsonResponse({"error": "Missing name or image."}, status=400)
 
-    # Decode base64 data URL
-    import base64
-    import re
-    header, encoded = image_data.split(",", 1)
-    binary = base64.b64decode(encoded)
+    if not image_data.startswith("data:image/png;base64,"):
+        return JsonResponse({"error": "Expected a PNG data URL."}, status=400)
 
-    frame_path = _session_dir(session_id) / "frames" / name
+    try:
+        binary = base64.b64decode(image_data.split(",", 1)[1], validate=True)
+    except (binascii.Error, ValueError):
+        return JsonResponse({"error": "Malformed base64 image data."}, status=400)
+
+    # Only overwrite frames that already belong to this session.
+    frame_path = _frame_path(session_id, name)
+    if not frame_path.exists():
+        return JsonResponse({"error": "Frame not found."}, status=404)
+
     frame_path.write_bytes(binary)
 
     return JsonResponse({"ok": True})
@@ -330,6 +397,26 @@ def api_import(request):
     if missing:
         return JsonResponse({"error": f"Metadata missing: {', '.join(missing)}"}, status=400)
 
+    # The metadata comes from an uploaded file, so bound every value that
+    # drives an allocation or a loop before acting on it.
+    try:
+        dims = {k: int(meta[k]) for k in required}
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "Metadata values must be integers."}, status=400)
+
+    if any(v < 1 for v in dims.values()):
+        return JsonResponse({"error": "Metadata values must be positive."}, status=400)
+    if dims["frameWidth"] > MAX_FRAME_DIM or dims["frameHeight"] > MAX_FRAME_DIM:
+        return JsonResponse(
+            {"error": f"Frame dimensions must be ≤ {MAX_FRAME_DIM}px."}, status=400)
+    if dims["totalFrames"] > MAX_IMPORT_FRAMES:
+        return JsonResponse(
+            {"error": f"Sprite sheets are limited to {MAX_IMPORT_FRAMES} frames."},
+            status=400)
+    if dims["totalFrames"] > dims["columns"] * dims["rows"]:
+        return JsonResponse(
+            {"error": "totalFrames exceeds the columns × rows grid."}, status=400)
+
     session_id = uuid.uuid4().hex[:12]
     sd = _session_dir(session_id)
     frames_dir = sd / "frames"
@@ -340,12 +427,10 @@ def api_import(request):
         import io
         sheet = Image.open(io.BytesIO(sprite_file.read())).convert("RGBA")
 
-        fw = meta["frameWidth"]
-        fh = meta["frameHeight"]
-        cols = meta["columns"]
-        rows = meta["rows"]
-        total = meta["totalFrames"]
-        fps = meta.get("fps", 10)
+        fw, fh = dims["frameWidth"], dims["frameHeight"]
+        cols, rows = dims["columns"], dims["rows"]
+        total = dims["totalFrames"]
+        fps = int(meta.get("fps", 10) or 10)
 
         for i in range(total):
             col = i % cols
@@ -371,4 +456,4 @@ def api_import(request):
         })
     except Exception as e:
         shutil.rmtree(sd, ignore_errors=True)
-        return JsonResponse({"error": str(e)}, status=500)
+        return _server_error("Sprite sheet import failed", e)

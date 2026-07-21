@@ -3,10 +3,26 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "django-insecure-mascot-studio-dev-key-change-in-prod"
+DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
-DEBUG = True
-ALLOWED_HOSTS = ["*"]
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "")
+if not SECRET_KEY:
+    if not DEBUG:
+        raise RuntimeError(
+            "DJANGO_SECRET_KEY must be set when DJANGO_DEBUG=0. "
+            "See .env.example."
+        )
+    SECRET_KEY = "django-insecure-dev-only-key-do-not-use-in-production"
+
+ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+# When this is empty under DEBUG, Django falls back to localhost/127.0.0.1/[::1].
+if not ALLOWED_HOSTS and not DEBUG:
+    raise RuntimeError(
+        "DJANGO_ALLOWED_HOSTS must list your hostnames when DJANGO_DEBUG=0. "
+        "See .env.example."
+    )
 
 INSTALLED_APPS = [
     "django.contrib.staticfiles",
@@ -59,5 +75,6 @@ MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # File upload limits
-DATA_UPLOAD_MAX_MEMORY_SIZE = 200 * 1024 * 1024  # 200 MB
-FILE_UPLOAD_MAX_MEMORY_SIZE = 200 * 1024 * 1024
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", 200))
+DATA_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_MB * 1024 * 1024
+FILE_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_MB * 1024 * 1024

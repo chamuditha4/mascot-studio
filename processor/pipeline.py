@@ -1,8 +1,7 @@
 """
-Processing pipeline — ported from notepal-mobile/scripts/process-mascot.py.
-Frame extraction, AI background removal, cleanup, crop, and sprite-sheet
-stitching.  All functions operate on file paths so they work inside Django
-views.
+Processing pipeline: frame extraction, AI background removal, despill
+cleanup, crop, and sprite-sheet stitching.  All functions operate on file
+paths so they work inside Django views.
 """
 
 import json

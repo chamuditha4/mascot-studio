@@ -2,14 +2,18 @@
 db.sqlite3
 *.pyc
 __pycache__/
+*.log
 
-# Media (user uploads)
-media/sessions/
+# Media (user uploads, generated frames and exports)
+media/
 
 # Environment
 .env
+.venv/
+venv/
 *.egg-info/
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
+.DS_Store

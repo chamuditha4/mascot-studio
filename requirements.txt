@@ -1,9 +1,9 @@
+# Core runtime. Also requires ffmpeg on PATH (system package).
 Django>=5.0
 Pillow>=10.0
 numpy>=1.24
 rembg>=2.0
-scipy>=1.10
-torch>=2.0
-torchvision>=0.15
-celery>=5.3
-redis>=5.0
+
+# Optional: the 'rvm' backend (temporal video matting) additionally needs
+# torch + torchvision — ~2 GB of wheels, so they are kept out of the
+# default set.  Install with:  pip install -r requirements-rvm.txt
